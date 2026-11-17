@@ -17,6 +17,10 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1
 
+.PARAMETER SkipCredentials
+  Cadastra a conexão sem pedir Client ID/Secret (útil em execução não interativa). Depois, no seu
+  terminal: sac-mcp set-credentials -c <conexão>
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Client usinalins -Environment qas `
     -TenantUrl https://<tenant>.<dc>.hcs.cloud.sap `
@@ -34,6 +38,7 @@ param(
   [string]$RedirectUri = "http://localhost:8765/callback",
   [switch]$AllowCustomDomain,
   [switch]$SkipRegister,
+  [switch]$SkipCredentials,
   [switch]$NoPrompt
 )
 
@@ -129,8 +134,8 @@ if ($Client -or $Environment -or $TenantUrl -or $TokenUrl) {
   }
   Step "Cadastrando conexão $Client / $Environment"
   $addArgs = @("add", "--client", $Client, "--environment", $Environment, "--tenant-url", $TenantUrl,
-               "--token-url", $TokenUrl, "--auth-flow", $AuthFlow, "--redirect-uri", $RedirectUri,
-               "--with-credentials")
+               "--token-url", $TokenUrl, "--auth-flow", $AuthFlow, "--redirect-uri", $RedirectUri)
+  if (-not $SkipCredentials) { $addArgs += "--with-credentials" }
   if ($AuthorizeUrl) { $addArgs += @("--authorize-url", $AuthorizeUrl) }
   if ($AllowCustomDomain) { $addArgs += "--allow-custom-domain" }
   Invoke-SacMcp @addArgs
@@ -139,7 +144,8 @@ if ($Client -or $Environment -or $TenantUrl -or $TokenUrl) {
 
 while (Confirm-Yes "Cadastrar uma (nova) conexão agora?") {
   Write-Host "Informe cliente, ambiente, URL do tenant e Token URL. A Authorize URL é derivada da Token URL."
-  Invoke-SacMcp add --auth-flow $AuthFlow --redirect-uri $RedirectUri --with-credentials
+  if ($SkipCredentials) { Invoke-SacMcp add --auth-flow $AuthFlow --redirect-uri $RedirectUri }
+  else { Invoke-SacMcp add --auth-flow $AuthFlow --redirect-uri $RedirectUri --with-credentials }
   if ($LASTEXITCODE -ne 0) { Write-Host "Cadastro não concluído (ver mensagem acima)." -ForegroundColor Yellow }
 }
 
