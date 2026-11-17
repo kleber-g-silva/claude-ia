@@ -10,10 +10,12 @@ import respx
 
 from sac_mcp import server
 from sac_mcp.auth import TokenManager
-from sac_mcp.config import Config, ConfigError
+from sac_mcp.config import Config, ConfigError, Registry
 from sac_mcp.redaction import redact
 from sac_mcp.sac_client import PolicyViolation, SacClient, SacPermissionError, summarize_metadata
 from tests.conftest import DES, TENANT, TOKEN_URL
+
+CONN = "acme-qas"
 
 METADATA_XML = """<?xml version="1.0" encoding="utf-8"?>
 <edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
@@ -52,9 +54,9 @@ def only_get_to_tenant(r):
 
 # ----------------------------------------------------------------- config
 def test_allowlist_defaults_to_deny(tmp_path):
-    cfg = Config(tenant_url=TENANT).validate()
+    cfg = Config(tenant_url=TENANT, token_url=TOKEN_URL).validate()
     assert cfg.model_allowlist == [] and not cfg.is_model_allowed("ANY")
-    assert Config(tenant_url=TENANT, model_allowlist=["*"]).validate().is_model_allowed("ANY")
+    assert Config(tenant_url=TENANT, token_url=TOKEN_URL, model_allowlist=["*"]).validate().is_model_allowed("ANY")
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -62,18 +64,23 @@ def test_allowlist_defaults_to_deny(tmp_path):
     {"redirect_uri": "http://evil.com:80/cb"}, {"default_top": 0}, {"max_top": 60000},
 ])
 def test_invalid_config(kwargs):
-    base = {"tenant_url": TENANT, **kwargs}
+    base = {"tenant_url": TENANT, "token_url": TOKEN_URL, **kwargs}
     with pytest.raises(ConfigError):
         Config(**base).validate()
 
 
 def test_config_file_and_env(monkeypatch, tmp_path):
+    # Adaptado ao multi-tenant: config.json com o registro de conexões (com BOM, como o PowerShell 5.1 grava).
     d = tmp_path / "cfg"
     d.mkdir()
-    (d / "config.json").write_text(json.dumps({"tenant_url": TENANT, "model_allowlist": ["A"]}))
-    assert Config.load().model_allowlist == ["A"]
-    monkeypatch.setenv("SAC_MODEL_ALLOWLIST", "B,C")
-    assert Config.load().model_allowlist == ["B", "C"]
+    conn = {"client": "acme", "environment": "qas", "tenant_url": TENANT, "token_url": TOKEN_URL,
+            "model_allowlist": ["A"]}
+    (d / "config.json").write_text(json.dumps({"connections": {CONN: conn}}), encoding="utf-8-sig")
+    cfg = Registry.load().get(CONN)
+    assert cfg.model_allowlist == ["A"] and cfg.authorize_url.endswith("/oauth/authorize")
+    (d / "config.json").write_text(json.dumps({"tenant_url": TENANT}))
+    with pytest.raises(ConfigError, match="formato antigo"):
+        Registry.load()
 
 
 def test_redaction():
@@ -162,9 +169,13 @@ def test_metadata_summary():
 
 # ----------------------------------------------------------------- MCP server
 @pytest.fixture
-def mcp_runtime(config, store, http):
+def mcp_runtime(config, store, http, tmp_path):
+    # Adaptado ao multi-tenant: uma conexão registrada e selecionada.
     config.auth_flow = "client_credentials"
-    server.runtime.setup(config, store, http)
+    config.client, config.environment = "acme", "qas"
+    reg = Registry({CONN: config}, tmp_path / "cfg" / "config.json")
+    server.runtime.configure(lambda: reg, lambda cid: store, http)
+    server.runtime.selected = CONN
     yield server.mcp
     server.runtime.__init__()
 
@@ -184,30 +195,37 @@ def payload(res):
 def test_tools_are_read_only(mcp_runtime):
     tools = asyncio.run(mcp_runtime.list_tools())
     names = {t.name for t in tools}
-    assert names == {"sac_auth_status", "sac_list_namespaces", "sac_list_models", "sac_get_model_metadata",
-                     "sac_get_fact_data", "sac_get_master_data"}
-    assert all(t.annotations.read_only_hint and not t.annotations.destructive_hint for t in tools)
+    queries = {"sac_auth_status", "sac_list_namespaces", "sac_list_models", "sac_get_model_metadata",
+               "sac_get_fact_data", "sac_get_master_data"}
+    management = {"sac_list_connections", "sac_add_connection", "sac_select_connection", "sac_remove_connection"}
+    assert names == queries | management
+    by_name = {t.name: t for t in tools}
+    assert all(by_name[n].annotations.read_only_hint and not by_name[n].annotations.destructive_hint for n in queries)
+    # única ferramenta destrutiva é local (cadastro/cofre), nunca no SAC
+    assert {n for n, t in by_name.items() if t.annotations.destructive_hint} == {"sac_remove_connection"}
+    for n in queries:  # conexão explícita obrigatória
+        assert "connection" in by_name[n].input_schema["required"]
 
 
 def test_tool_fact_data_inline_and_limits(mcp_runtime, mocked):
     mocked.get(f"{DES}/providers/sac/MODEL1").mock(return_value=httpx.Response(200, json=SERVICE_DOC))
     mocked.get(f"{DES}/providers/sac/MODEL1/FactData").mock(
         return_value=httpx.Response(200, json={"value": [{"Account": "A1", "SignedData": 10}]}))
-    out = payload(call(mcp_runtime, "sac_get_fact_data", {"provider_id": "MODEL1"}))
+    out = payload(call(mcp_runtime, "sac_get_fact_data", {"connection": CONN, "provider_id": "MODEL1"}))
     assert out["rows"] == 1 and out["limit"] == 1000 and out["columns"] == ["Account", "SignedData"]
     assert list(csv.reader(io.StringIO(out["csv"])))[1] == ["A1", "10"]
     with pytest.raises(Exception, match="50000"):
-        call(mcp_runtime, "sac_get_fact_data", {"provider_id": "MODEL1", "top": 50001})
+        call(mcp_runtime, "sac_get_fact_data", {"connection": CONN, "provider_id": "MODEL1", "top": 50001})
     with pytest.raises(Exception, match="allowlist"):
-        call(mcp_runtime, "sac_get_fact_data", {"provider_id": "OTHER"})
+        call(mcp_runtime, "sac_get_fact_data", {"connection": CONN, "provider_id": "OTHER"})
 
 
 def test_tool_fact_data_to_file(mcp_runtime, mocked, config):
     mocked.get(f"{DES}/providers/sac/MODEL1").mock(return_value=httpx.Response(200, json=SERVICE_DOC))
     mocked.get(f"{DES}/providers/sac/MODEL1/FactData").mock(
         return_value=httpx.Response(200, json={"value": [{"Account": "A1"}]}))
-    out = payload(call(mcp_runtime, "sac_get_fact_data", {"provider_id": "MODEL1", "output": "file"}))
-    assert "csv" not in out and Path(out["file"]).parent == Path(config.export_dir)
+    out = payload(call(mcp_runtime, "sac_get_fact_data", {"connection": CONN, "provider_id": "MODEL1", "output": "file"}))
+    assert "csv" not in out and Path(out["file"]).parent == Path(config.export_dir) / CONN
     assert Path(out["file"]).read_text(encoding="utf-8-sig").startswith("Account")
 
 
@@ -217,9 +235,9 @@ def test_tool_metadata_and_models(mcp_runtime, mocked):
     mocked.get(f"{DES}/administration/Namespaces(NamespaceID='sac')/Providers").mock(
         return_value=httpx.Response(200, json={"value": [{"ProviderID": "MODEL1", "ProviderName": "Opex"},
                                                          {"ProviderID": "M2", "ProviderName": "HR"}]}))
-    meta = payload(call(mcp_runtime, "sac_get_model_metadata", {"provider_id": "MODEL1"}))
+    meta = payload(call(mcp_runtime, "sac_get_model_metadata", {"connection": CONN, "provider_id": "MODEL1"}))
     assert meta["available_entity_sets"] == ["FactData", "AccountMaster"]
-    models = payload(call(mcp_runtime, "sac_list_models", {"name_contains": "op"}))
+    models = payload(call(mcp_runtime, "sac_list_models", {"connection": CONN, "name_contains": "op"}))
     assert models["count"] == 1 and models["models"][0]["allowed_by_allowlist"] is True
 
 
@@ -227,5 +245,5 @@ def test_tool_errors_do_not_leak_secrets(mcp_runtime, mocked):
     mocked.get(f"{DES}/administration/Namespaces").mock(
         return_value=httpx.Response(500, text="boom client_secret=LEAK Bearer eyJx.eyJy.z"))
     with pytest.raises(Exception) as ei:
-        call(mcp_runtime, "sac_list_namespaces")
+        call(mcp_runtime, "sac_list_namespaces", {"connection": CONN})
     assert "LEAK" not in str(ei.value) and "eyJx" not in str(ei.value)
